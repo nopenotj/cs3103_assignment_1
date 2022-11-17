@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+# Echo server program
+import socket
+import sys
+import os
+from itertools import count
+from collections import defaultdict
+from threading import Timer
+from datetime import datetime
+
+# DEBUG LEVELS
+[TELEMETRY, ERROR, WARN, DEBUG] = range(4)
+
+
+# PROGRAM CONSTANTS
+LOG_LEVEL = { "TELEMETRY": TELEMETRY, "ERROR": ERROR, "WARN": WARN, "DEBUG": DEBUG } [os.environ['LOG_LEVEL']] if 'LOG_LEVEL' in os.environ else TELEMETRY
+LOG_TIME = False
+HOST = 'localhost'
+NO_BACKLOG = 50
+SOCK_TIMEOUT = 5
+SUB_IMG_URL = 'http://ocna0.d2.comp.nus.edu.sg:50000/change.jpg'
+BUFF_SIZE = 1024
+TELEMETRY_TIMEOUT = 3
+
+
+class bcolors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+class logger:
+    debug = lambda *x:  print(bcolors.OKBLUE  + logger.date() +'[DEBUG]',*x, bcolors.ENDC) if LOG_LEVEL >= DEBUG else None
+    warn  = lambda *x:  print(bcolors.WARNING + logger.date() +'[WARN]',*x, bcolors.ENDC) if LOG_LEVEL >= WARN  else None
+    err   = lambda *x:  print(bcolors.FAIL    + logger.date() +'[ERROR]',*x, bcolors.ENDC) if LOG_LEVEL >= ERROR  else None
+    tele  = lambda a,b:  print(logger.date() + f'{a}, {b}') if LOG_LEVEL >= TELEMETRY  else None
+
+    date = lambda : f'[{datetime.now().strftime("%H:%M:%S")}]' if LOG_TIME else ''
+
+
+def usage():
+    print(f'usage: {sys.argv[0]} port [img_substitution] [attack_mode]')
+    print(f'  port:              the port proxy is listening on')
+    print(f'  img_substitution:  set to 1 to replace all imgs')
+    print(f'  attack_mode:       set to 1 to turnon attack_mode')
+
+def parse_headers(raw):
+    res = {}
+    for h in raw.split(b'\r\n'):
+        key,val = h.split(b':',1)
+        res[key.strip().lower().decode()] = val.strip().decode()
+    return res
+
+
+def get_http_msg(conn):
+    for i in count():
+        if b'\r\n\r\n' in conn.recv(i * BUFF_SIZE, socket.MSG_PEEK): break
+
+    data = conn.recv(i* BUFF_SIZE, socket.MSG_PEEK).split(b'\r\n\r\n',1)[0]
+    conn.recv(len(data) + 4)
+
+    status_line, headers = data.split(b'\r\n',1)
+    raw = status_line + b'\r\n' + headers + b'\r\n\r\n'
+    headers = parse_headers(headers)
+
+    payload = b''
+    if 'content-length' in headers:
+        while len(payload) < int(headers['content-length']):
+            payload += conn.recv(int(headers['content-length']) - len(payload))
+    if 'transfer-encoding' in headers and headers['transfer-encoding'].lower() == 'chunked':
+        for i in count():
+            if b'0\r\n\r\n' in conn.recv(i * BUFF_SIZE, socket.MSG_PEEK): break
+        payload = conn.recv(i* BUFF_SIZE, socket.MSG_PEEK).split(b'0\r\n\r\n',1)[0]
+        conn.recv(len(payload) + 5)
+        payload += b'0\r\n\r\n'
+
+    raw += payload
+    method, path, protocol = status_line.decode().split(' ', 2)
+    return {
+        "method": method,
+        "path": path,
+        "protocol": protocol,
+        "headers": headers,
+        "payload": payload,
+        "raw": raw,
+    }
+
+def reconstruct_request(msg):
+    status_line = ' '.join([msg['method'], msg['path'], msg['protocol']]).encode()
+    headers = '\r\n'.join([k + ': ' + v for k,v in msg['headers'].items()]).encode()
+    return status_line + b'\r\n' + headers + b'\r\n\r\n' + msg['payload']
+
+
+def request(url, msg):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.connect(url)
+        s.sendall(msg)
+        return get_http_msg(s)
+
+
+def get_host(raw):
+    if ':' in raw:
+        t = raw.split(':')
+        return t[0],int(t[1])
+    else:
+        return (raw, 80)
+
+def http_res(status, msg, protocol):
+    http_codes = {
+        200: "OK"
+    }
+    return f"{protocol} {status} {http_codes[status]}\r\nContent-Length: {len(msg)}\r\n\r\n{msg}".encode()
+
+
+def run_proxy(host, port, no_backlog, img_sub, attack_mode):
+    r,w = os.pipe()
+    #####################
+    # Telemetetry Handler
+    #####################
+    if os.fork() > 0:
+        os.close(w)
+        r = os.fdopen(r)
+        m = defaultdict(int)
+        timers = {}
+        def d(x):
+            logger.tele(x, m[x])
+            del m[x]
+        while True:
+            #read and compute telemetry
+            o = r.readline()
+            if not o: exit(0)
+            url, size = o.strip().split(', ')
+            m[url] += int(size)
+            if url in timers: timers[url].cancel()
+            timers[url] = Timer(TELEMETRY_TIMEOUT, d, [url])
+            timers[url].start()
+            
+
+    #####################
+    # Connection Handler
+    #####################
+    os.close(r)
+    w = os.fdopen(w,'w')
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host, port))
+        s.listen(no_backlog)
+        while True:
+            conn, addr = s.accept()
+            logger.debug('New TCP connection by', addr)
+
+            # child process
+            if os.fork() == 0: 
+                conn.settimeout(SOCK_TIMEOUT)
+                with conn:
+                    close_connection = False
+                    while not close_connection: # Persistent Connection
+                        response = None
+                        try:
+                            msg = get_http_msg(conn)
+                            headers = msg['headers']
+                            logger.debug(addr, 'fetching resource', msg['path'])
+
+                            if '1.0' in msg['protocol']: close_connection = True
+                            if 'connection' in headers: close_connection = headers['connection'] == 'close'
+                            if msg['headers']['host'] == f'{host}:{port}': raise Exception('Proxying a call to proxy will result in an infinite loop')
+
+                            response = request(get_host(headers['host']), reconstruct_request(msg))
+                            if img_sub and 'content-type' in response['headers'] and 'image' in response['headers']['content-type']: 
+                                msg['path'] = SUB_IMG_URL
+                                response = request(get_host(headers['host']), reconstruct_request(msg))
+
+                            if attack_mode:
+                                conn.sendall(http_res(200, "You are being attacked", msg['protocol']))
+                                continue
+                            
+                            conn.sendall(response['raw'])
+                        except socket.timeout as e:
+                            logger.warn(f'Connection {addr} has timed out.')
+                        except Exception as e:
+                            logger.err(f'Connection {addr} closed expectedly because : {e}')
+                        finally:
+                            if response: w.write(f"{msg['headers']['referer'] if 'referer' in msg['headers'] else msg['path']}, {len(response['raw'])}\n")
+                            exit(0)
+            # parent process
+            conn.close() # ditch the fd and leave it to child to handle
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        usage()
+        exit(1)
+    img_sub = len(sys.argv) >= 3 and sys.argv[2] == '1'
+    attack_mode = len(sys.argv) >= 4 and sys.argv[3] == '1'
+    run_proxy(HOST, int(sys.argv[1]), NO_BACKLOG, img_sub, attack_mode)
