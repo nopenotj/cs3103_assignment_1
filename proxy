@@ -15,7 +15,7 @@ from datetime import datetime
 # PROGRAM CONSTANTS
 LOG_LEVEL = { "TELEMETRY": TELEMETRY, "ERROR": ERROR, "WARN": WARN, "DEBUG": DEBUG } [os.environ['LOG_LEVEL']] if 'LOG_LEVEL' in os.environ else TELEMETRY
 LOG_TIME = False
-HOST = 'localhost'
+HOST = ''
 NO_BACKLOG = 50
 SOCK_TIMEOUT = 5
 SUB_IMG_URL = 'http://ocna0.d2.comp.nus.edu.sg:50000/change.jpg'
@@ -69,7 +69,9 @@ def get_http_msg(conn):
     headers = parse_headers(headers)
 
     payload = b''
+    size = 0
     if 'content-length' in headers:
+        size = int(headers['content-length'])
         while len(payload) < int(headers['content-length']):
             payload += conn.recv(int(headers['content-length']) - len(payload))
     if 'transfer-encoding' in headers and headers['transfer-encoding'].lower() == 'chunked':
@@ -77,6 +79,14 @@ def get_http_msg(conn):
             if b'0\r\n\r\n' in conn.recv(i * BUFF_SIZE, socket.MSG_PEEK): break
         payload = conn.recv(i* BUFF_SIZE, socket.MSG_PEEK).split(b'0\r\n\r\n',1)[0]
         conn.recv(len(payload) + 5)
+
+        q = payload.split(b'\r\n')
+        q.pop()
+        while True:
+            if not q: break
+            size += int(q.pop(0),base=16)
+            q.pop(0)
+
         payload += b'0\r\n\r\n'
 
     raw += payload
@@ -88,6 +98,7 @@ def get_http_msg(conn):
         "headers": headers,
         "payload": payload,
         "raw": raw,
+        "size": size,
     }
 
 def reconstruct_request(msg):
@@ -178,13 +189,14 @@ def run_proxy(host, port, no_backlog, img_sub, attack_mode):
                                 conn.sendall(http_res(200, "You are being attacked", msg['protocol']))
                                 continue
                             
+                            logger.debug(addr, f'received resource {response["size"]}B')
                             conn.sendall(response['raw'])
                         except socket.timeout as e:
                             logger.warn(f'Connection {addr} has timed out.')
                         except Exception as e:
                             logger.err(f'Connection {addr} closed expectedly because : {e}')
                         finally:
-                            if response: w.write(f"{msg['headers']['referer'] if 'referer' in msg['headers'] else msg['path']}, {len(response['raw'])}\n")
+                            if response: w.write(f"{msg['headers']['referer'] if 'referer' in msg['headers'] else msg['path']}, {response['size']}\n")
                             exit(0)
             # parent process
             conn.close() # ditch the fd and leave it to child to handle
